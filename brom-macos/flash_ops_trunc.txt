@@ -1,0 +1,20 @@
+write_part init_boot_a brom-work/trunc/init_boot_a.bin
+write_part vbmeta_a brom-work/trunc/vbmeta_a.bin
+read_part vbmeta_a 0 8192 brom-work/verify_vbmeta_a.bin
+write_part vbmeta_odm_a brom-work/trunc/vbmeta_odm_a.bin
+write_part vbmeta_product_a brom-work/trunc/vbmeta_product_a.bin
+write_part vbmeta_system_a brom-work/trunc/vbmeta_system_a.bin
+write_part vbmeta_system_ext_a brom-work/trunc/vbmeta_system_ext_a.bin
+write_part vbmeta_vendor_a brom-work/trunc/vbmeta_vendor_a.bin
+write_part boot_a brom-work/trunc/boot_a.bin
+write_part vendor_boot_a brom-work/trunc/vendor_boot_a.bin
+write_part metadata brom-work/trunc/metadata.bin
+write_part logo brom-work/trunc/logo.bin
+write_part hypervsior_a brom-work/trunc/hypervsior_a.bin
+write_part ch_sys_a brom-work/trunc/ch_sys_a.bin
+write_part common_rs2_a brom-work/trunc/common_rs2_a.bin
+write_part super brom-work/trunc/super.bin
+erase_part nr_runtimenv1
+erase_part nr_runtimenv2
+erase_part userdata
+reset
